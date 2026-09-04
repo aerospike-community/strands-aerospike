@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "strands-aerospike"
+version = "0.1.0"
+description = "Aerospike-backed storage, session, and memory backends for the Strands Agents SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
+authors = [{ name = "strands-aerospike contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "strands-agents>=1.0.0",
+    "aerospike>=15.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<10.0.0",
+    "pytest-asyncio>=0.24.0,<1.5.0",
+    "ruff>=0.13.0,<0.17.0",
+    "mypy>=1.15.0,<3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/strands-agents/strands-aerospike"
+Documentation = "https://strandsagents.com"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/strands_aerospike"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["integration: requires a running Aerospike server (see scripts/start_aerospike_ce.sh)"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["B", "D", "E", "F", "G", "I", "LOG", "UP"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_optional = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["aerospike", "aerospike.*", "aerospike_helpers", "aerospike_helpers.*"]
+ignore_missing_imports = true
