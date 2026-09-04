@@ -83,3 +83,28 @@ pytest
 Tests are integration tests against a real server (see
 [docs/DESIGN.md](docs/DESIGN.md#testing)); without the container running, the suite
 skips cleanly instead of failing.
+
+## Benchmarks
+
+[reports/REPORT.md](reports/REPORT.md) quantifies how `AerospikeStorage`,
+`AerospikeSessionManager`, and `AerospikeMemoryStore` perform against every other
+`Storage`/`SessionRepository`/`MemoryStore` backend `strands-agents` ships
+(`InMemoryStorage`, `LocalFileStorage`, `S3Storage`, `FileSessionManager`,
+`S3SessionManager`, `FileMemoryStore`), across four data-volume scales per subsystem --
+the largest a configurable multi-gigabyte "bulk" tier (10GB by default for the Storage
+interface; see `reports/REPORT.md`'s environment section for how each subsystem's bulk
+tier is sized) -- with latency histograms under `reports/histograms/`.
+
+The same content also renders as `reports/REPORT.html` (open it directly in a
+browser, or serve `reports/` locally, for a far more legible read than the raw
+Markdown) and `reports/REPORT.pdf` (landscape, for sharing or printing) — all
+three are generated from one Markdown string, so there's nothing to keep in
+sync between them.
+
+Regenerate it from a clean run:
+
+```bash
+./scripts/start_aerospike_ce.sh
+uv pip install --python .venv/bin/python -e ".[dev,benchmark]" -e ../harness-sdk/strands-py
+.venv/bin/python benchmark/benchmark.py
+```
