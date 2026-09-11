@@ -54,11 +54,19 @@ def connect_aerospike() -> aerospike.Client:
 
 
 def truncate_aerospike_set(client: aerospike.Client, set_name: str) -> None:
-    """Truncate a benchmark set between runs, ignoring 'set does not exist yet'."""
+    """Truncate a benchmark set between runs.
+
+    Truncating a set that has never held any records is a normal no-op on the
+    server, so a failure here almost always means something else went wrong
+    (e.g. a transient overload after a preceding bulk-tier run). Swallowing
+    that silently lets the next scenario seed on top of leftover keys from a
+    prior run, corrupting its scale/key count with no warning -- so print
+    instead of ignoring, even though seeding proceeds either way.
+    """
     try:
         client.truncate(AEROSPIKE_NAMESPACE, set_name, 0)
-    except aerospike.exception.AerospikeError:
-        pass
+    except aerospike.exception.AerospikeError as error:
+        print(f"Warning: failed to truncate set '{set_name}': {error}", flush=True)
 
 
 class MotoS3(NamedTuple):

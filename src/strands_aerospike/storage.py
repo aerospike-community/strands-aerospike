@@ -120,34 +120,65 @@ class AerospikeStorage:
 
     def _write_sync(self, key: str, data: bytes) -> None:
         try:
-            self._clear_existing_chunks(key)
+            # Look up any stale chunks from a previous chunked write, but don't remove
+            # them yet: deleting first and writing second leaves a window where a
+            # failed/partial new write has already destroyed the old value's chunks,
+            # turning a would-be write failure into permanent data loss on read.
+            # Removing them only after the new write succeeds keeps the old value
+            # intact (and readable) until the new one is durably in place.
+            previous_chunk_count = self._get_previous_chunk_count(key)
             if len(data) <= self._max_value_size:
-                self._client.put(self._primary_key(key), {_KEY_BIN: key, _VALUE_BIN: bytes(data)}, meta=self._meta())
+                self._client.put(
+                    self._primary_key(key),
+                    {_KEY_BIN: key, _VALUE_BIN: bytes(data), _CHUNK_COUNT_BIN: aerospike.null()},
+                    meta=self._meta(),
+                )
             else:
                 self._write_chunked(key, data)
+            if previous_chunk_count:
+                self._remove_chunks(key, previous_chunk_count)
         except aerospike_exception.AerospikeError as error:
             raise StorageError(f"Failed to write '{key}'") from error
 
-    def _clear_existing_chunks(self, key: str) -> None:
-        """Remove any chunk records left over from a previous chunked write under key."""
+    def _get_previous_chunk_count(self, key: str) -> int | None:
+        """Return key's existing chunk count, if any, without removing anything."""
         try:
             _, _, bins = self._client.get(self._primary_key(key))
         except aerospike_exception.RecordNotFound:
-            return
-        previous_chunk_count = bins.get(_CHUNK_COUNT_BIN)
+            return None
+        return bins.get(_CHUNK_COUNT_BIN)  # type: ignore[no-any-return]
+
+    def _remove_chunks(self, key: str, chunk_count: int) -> None:
+        chunk_keys = [self._chunk_record_key(key, index) for index in range(chunk_count)]
+        self._client.batch_remove(chunk_keys)
+
+    def _clear_existing_chunks(self, key: str) -> None:
+        """Remove any chunk records left over from a previous chunked write under key."""
+        previous_chunk_count = self._get_previous_chunk_count(key)
         if previous_chunk_count:
-            chunk_keys = [self._chunk_record_key(key, index) for index in range(previous_chunk_count)]
-            self._client.batch_remove(chunk_keys)
+            self._remove_chunks(key, previous_chunk_count)
 
     def _write_chunked(self, key: str, data: bytes) -> None:
         chunks = [data[i : i + self._max_value_size] for i in range(0, len(data), self._max_value_size)]
         writes = [
-            batch_records.Write(self._chunk_record_key(key, index), [ops.write(_VALUE_BIN, bytes(chunk))])
+            batch_records.Write(
+                self._chunk_record_key(key, index), [ops.write(_VALUE_BIN, bytes(chunk))], meta=self._meta()
+            )
             for index, chunk in enumerate(chunks)
         ]
+        writes.append(
+            batch_records.Write(
+                self._primary_key(key),
+                [
+                    ops.write(_KEY_BIN, key),
+                    ops.write(_CHUNK_COUNT_BIN, len(chunks)),
+                    ops.write(_VALUE_BIN, aerospike.null()),
+                ],
+                meta=self._meta(),
+            )
+        )
         result = self._client.batch_write(batch_records.BatchRecords(writes))
         _raise_on_batch_failure(result, context=f"writing chunks for '{key}'")
-        self._client.put(self._primary_key(key), {_KEY_BIN: key, _CHUNK_COUNT_BIN: len(chunks)}, meta=self._meta())
 
     async def read(self, key: str) -> bytes | None:
         """Retrieve the bytes previously stored under key.
@@ -205,8 +236,11 @@ class AerospikeStorage:
 
     def _delete_sync(self, key: str) -> None:
         try:
-            self._clear_existing_chunks(key)
-            self._client.remove(self._primary_key(key))
+            previous_chunk_count = self._get_previous_chunk_count(key)
+            keys = [self._primary_key(key)]
+            if previous_chunk_count:
+                keys.extend(self._chunk_record_key(key, index) for index in range(previous_chunk_count))
+            self._client.batch_remove(keys)
         except aerospike_exception.RecordNotFound:
             pass
         except aerospike_exception.AerospikeError as error:

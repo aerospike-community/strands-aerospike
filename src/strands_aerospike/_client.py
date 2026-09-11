@@ -18,9 +18,24 @@ _clients: dict[tuple[Any, ...], aerospike.Client] = {}
 _lock = threading.Lock()
 
 
+def _freeze(value: Any) -> Any:
+    """Recursively convert dicts/lists into a hashable, order-independent representation."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, _freeze(val)) for key, val in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 def _config_key(hosts: list[tuple[str, int]], policies: dict[str, Any] | None) -> tuple[Any, ...]:
-    """Build a hashable cache key from client configuration."""
-    policies_key = tuple(sorted(policies.items())) if policies else ()
+    """Build a hashable cache key from client configuration.
+
+    ``policies`` values are commonly nested dicts (e.g. ``{"read": {"total_timeout": 1000}}``,
+    the structured form this module's own docstring documents), which a bare
+    ``tuple(sorted(policies.items()))`` cannot hash -- ``_freeze`` recurses so nested
+    dicts/lists become hashable too.
+    """
+    policies_key = _freeze(policies) if policies else ()
     return (tuple(hosts), policies_key)
 
 

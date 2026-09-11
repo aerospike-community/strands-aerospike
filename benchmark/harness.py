@@ -55,33 +55,53 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
     return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (k - lower)
 
 
-def time_sync(fn: Callable[[int], None], *, reps: int, warmup: int) -> list[float]:
+def time_sync(
+    fn: Callable[[int], None], *, reps: int, warmup: int, on_iteration: Callable[[int], None] | None = None
+) -> list[float]:
     """Time ``reps`` calls to a synchronous, per-iteration-indexed operation.
 
     ``fn`` receives the iteration index (including warmup iterations, which run
     first with indices ``0..warmup-1`` before timed indices ``warmup..warmup+reps-1``)
     so callers can vary the argument per call (e.g. a distinct key per write)
     without that bookkeeping leaking into the timed section.
+
+    ``on_iteration``, if given, runs once per iteration (e.g. to drive a progress
+    bar) -- always called *after* a timed iteration's sample is recorded, so its
+    own cost is never included in the measured latency.
     """
     for i in range(warmup):
         fn(i)
+        if on_iteration is not None:
+            on_iteration(i)
     samples: list[float] = []
     for i in range(warmup, warmup + reps):
         start = time.perf_counter()
         fn(i)
         samples.append(time.perf_counter() - start)
+        if on_iteration is not None:
+            on_iteration(i)
     return samples
 
 
-async def time_async(fn: Callable[[int], Awaitable[None]], *, reps: int, warmup: int) -> list[float]:
+async def time_async(
+    fn: Callable[[int], Awaitable[None]],
+    *,
+    reps: int,
+    warmup: int,
+    on_iteration: Callable[[int], None] | None = None,
+) -> list[float]:
     """Async counterpart to :func:`time_sync`."""
     for i in range(warmup):
         await fn(i)
+        if on_iteration is not None:
+            on_iteration(i)
     samples: list[float] = []
     for i in range(warmup, warmup + reps):
         start = time.perf_counter()
         await fn(i)
         samples.append(time.perf_counter() - start)
+        if on_iteration is not None:
+            on_iteration(i)
     return samples
 
 

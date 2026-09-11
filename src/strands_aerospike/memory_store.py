@@ -12,15 +12,19 @@ search -- pair it with a dedicated vector store for that access pattern if neede
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import aerospike
 from aerospike import exception as aerospike_exception
 from aerospike import predicates
 from aerospike_helpers import expressions as exp
+from aerospike_helpers.operations import expression_operations as expr_ops
+from aerospike_helpers.operations import list_operations as list_ops
+from aerospike_helpers.operations import operations as ops
 from strands.memory.extraction.model_extractor import ModelExtractor
 from strands.memory.extraction.types import ExtractionConfig, ExtractionResult, Extractor, ExtractorContext
 from strands.memory.types import MemoryEntry, Metadata, SearchOptions
@@ -37,6 +41,11 @@ _TXT_BIN = "txt"
 _TOK_BIN = "tok"
 _STORE_BIN = "store"
 _MD_BIN = "md"
+
+_TOK_WRITE_POLICY: Final[dict[str, int]] = {
+    "write_flags": aerospike.LIST_WRITE_ADD_UNIQUE | aerospike.LIST_WRITE_NO_FAIL | aerospike.LIST_WRITE_PARTIAL
+}
+_KEY_SEND_POLICY: Final[dict[str, int]] = {"key": aerospike.POLICY_KEY_SEND}
 
 _DEFAULT_EXTRACTION_FRAMING = (
     "You extract durable facts worth remembering across future conversations from a transcript."
@@ -57,12 +66,19 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _slugify(text: str) -> str:
-    """Convert text to a URL-safe kebab-case slug, truncated to 50 characters."""
+    """Convert text to a URL-safe kebab-case slug, capped at 50 characters.
+
+    Slugs longer than the cap are truncated with an 8-hex-char content-hash
+    suffix rather than a bare cut, so two different headings that happen to
+    share the same 50-character prefix don't collide into the same record key.
+    """
     slug = text.lower()
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = slug.strip()
     slug = re.sub(r"\s+", "-", slug)
-    slug = slug[:_MAX_SLUG_LENGTH]
+    if len(slug) > _MAX_SLUG_LENGTH:
+        digest = hashlib.sha1(slug.encode("utf-8")).hexdigest()[:8]
+        slug = f"{slug[: _MAX_SLUG_LENGTH - len(digest) - 1].rstrip('-')}-{digest}"
     return slug.rstrip("-")
 
 
@@ -133,7 +149,6 @@ class AerospikeMemoryStore:
         self._set = set
         self._index_name = _index_name(set)
         self._client = client if client is not None else get_client(hosts)
-        self._write_lock = asyncio.Lock()
 
         self.extraction: ExtractionConfig | bool | None = self._resolve_extraction(extraction)
 
@@ -256,30 +271,37 @@ class AerospikeMemoryStore:
         slug = _slugify(first_line) or f"entry-{int(time.time() * 1000)}"
         record_key = f"{self.name}:{slug}"
 
-        async with self._write_lock:
-            await asyncio.to_thread(self._add_sync, record_key, content, lines, metadata)
+        await asyncio.to_thread(self._add_sync, record_key, content, lines, metadata)
 
         return record_key
 
     def _add_sync(self, record_key: str, content: str, lines: list[str], metadata: Metadata | None) -> None:
-        try:
-            _, _, existing_bins = self._client.get((self._namespace, self._set, record_key))
-            existing_content = existing_bins.get(_TXT_BIN, "")
-            new_facts = "\n".join(lines[1:]).strip()
-            merged = f"{existing_content.rstrip()}\n{new_facts}" if new_facts else existing_content
-        except aerospike_exception.RecordNotFound:
-            merged = content
+        new_facts = "\n".join(lines[1:]).strip()
 
-        bins: dict[str, Any] = {
-            _TXT_BIN: merged,
-            _TOK_BIN: sorted(_tokenize(merged)),
-            _STORE_BIN: self.name,
-        }
+        # Single atomic operate() call: no read, no generation check, no retry loop.
+        # The expression-write seeds `txt` with just the heading only when the bin is
+        # absent (EXP_WRITE_CREATE_ONLY + EXP_WRITE_POLICY_NO_FAIL makes this a no-op,
+        # not an error, on an existing record), the append adds new facts to whatever
+        # is already there, and the token list's ADD_UNIQUE write policy merges tokens
+        # without needing to read the existing list first. This makes repeat calls to
+        # the same heading -- even from separate processes -- converge safely with no
+        # client-side locking or optimistic-concurrency retry.
+        built_ops: list[dict[str, Any]] = [
+            expr_ops.expression_write(
+                _TXT_BIN,
+                exp.Val(lines[0]).compile(),
+                aerospike.EXP_WRITE_CREATE_ONLY | aerospike.EXP_WRITE_POLICY_NO_FAIL,
+            )
+        ]
+        if new_facts:
+            built_ops.append(ops.append(_TXT_BIN, f"\n{new_facts}"))
+        built_ops.append(list_ops.list_append_items(_TOK_BIN, sorted(_tokenize(content)), _TOK_WRITE_POLICY))
+        built_ops.append(ops.write(_STORE_BIN, self.name))
         if metadata is not None:
-            bins[_MD_BIN] = json.dumps(metadata, ensure_ascii=False)
+            built_ops.append(ops.write(_MD_BIN, json.dumps(metadata, ensure_ascii=False)))
 
         try:
-            self._client.put((self._namespace, self._set, record_key), bins)
+            self._client.operate((self._namespace, self._set, record_key), built_ops, policy=_KEY_SEND_POLICY)
         except aerospike_exception.AerospikeError as error:
             raise StorageError(f"Failed to write memory entry '{record_key}'") from error
 

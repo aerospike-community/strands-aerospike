@@ -90,12 +90,8 @@ def _run_async_op(
     """Time one async op with a live progress bar, then print its final mean/elapsed."""
     bar = _ProgressBar(total=warmup + reps, prefix=f"  [{name}] {op_name}")
 
-    async def with_progress(i: int) -> None:
-        await fn(i)
-        bar.update()
-
     op_start = time.perf_counter()
-    samples = asyncio.run(time_async(with_progress, reps=reps, warmup=warmup))
+    samples = asyncio.run(time_async(fn, reps=reps, warmup=warmup, on_iteration=lambda _i: bar.update()))
     bar.clear()
     result = Samples(interface=interface, operation=op_name, backend=name, scale=scale, latencies_s=samples)
     print(
@@ -120,12 +116,8 @@ def _run_sync_op(
     """Time one sync op with a live progress bar, then print its final mean/elapsed."""
     bar = _ProgressBar(total=warmup + reps, prefix=f"  [{name}] {op_name}")
 
-    def with_progress(i: int) -> None:
-        fn(i)
-        bar.update()
-
     op_start = time.perf_counter()
-    samples = time_sync(with_progress, reps=reps, warmup=warmup)
+    samples = time_sync(fn, reps=reps, warmup=warmup, on_iteration=lambda _i: bar.update())
     bar.clear()
     result = Samples(interface=interface, operation=op_name, backend=name, scale=scale, latencies_s=samples)
     print(

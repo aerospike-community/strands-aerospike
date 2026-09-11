@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import aerospike
@@ -64,10 +65,43 @@ def test_agent_create_read_update(repository: AerospikeSessionManager) -> None:
     assert updated.created_at == read_back.created_at
 
 
+def test_create_agent_appends_to_session_agent_ids_bin(
+    repository: AerospikeSessionManager, client: aerospike.Client, namespace: str
+) -> None:
+    agent = SessionAgent(agent_id="agent-1", state={}, conversation_manager_state={})
+    repository.create_agent("test-session", agent)
+
+    _, _, bins = client.get((namespace, "strands_sessions", "test-session"))
+    assert "agent-1" in bins["aids"]
+
+
 def test_update_agent_missing_raises(repository: AerospikeSessionManager) -> None:
     agent = SessionAgent(agent_id="ghost", state={}, conversation_manager_state={})
     with pytest.raises(SessionException, match="does not exist"):
         repository.update_agent("test-session", agent)
+
+
+async def test_concurrent_update_agent_does_not_lose_a_write(repository: AerospikeSessionManager) -> None:
+    """Two concurrent update_agent calls for the same agent must never silently clobber
+
+    one another: both complete without raising, and the final state matches one of the
+    two calls' payloads (generation-check retry resolves the race instead of the later
+    put unconditionally overwriting the earlier one with no signal either write happened).
+    """
+    agent = SessionAgent(agent_id="agent-1", state={"key": "initial"}, conversation_manager_state={})
+    repository.create_agent("test-session", agent)
+
+    first = SessionAgent(agent_id="agent-1", state={"key": "first"}, conversation_manager_state={})
+    second = SessionAgent(agent_id="agent-1", state={"key": "second"}, conversation_manager_state={})
+
+    await asyncio.gather(
+        asyncio.to_thread(repository.update_agent, "test-session", first),
+        asyncio.to_thread(repository.update_agent, "test-session", second),
+    )
+
+    updated = repository.read_agent("test-session", "agent-1")
+    assert updated is not None
+    assert updated.state in ({"key": "first"}, {"key": "second"})
 
 
 def test_message_create_read_update_and_list(repository: AerospikeSessionManager) -> None:

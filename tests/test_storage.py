@@ -38,6 +38,19 @@ async def test_delete_missing_key_is_noop(storage: AerospikeStorage) -> None:
     await storage.delete("never-existed")
 
 
+async def test_delete_removes_chunked_value_and_all_chunks(client: aerospike.Client, namespace: str) -> None:
+    storage = AerospikeStorage(namespace, client=client, max_value_size=10)
+    await storage.write("large", b"0123456789" * 5)  # 50 bytes -> 5 chunks
+
+    await storage.delete("large")
+
+    assert await storage.read("large") is None
+    for index in range(5):
+        chunk_key = (namespace, "strands_storage_chunks", f"large#{index}")
+        with pytest.raises(aerospike.exception.RecordNotFound):
+            client.get(chunk_key)
+
+
 async def test_list_matches_prefix(storage: AerospikeStorage) -> None:
     await storage.write("session/a/state.json", b"1")
     await storage.write("session/b/state.json", b"2")
@@ -64,6 +77,19 @@ async def test_chunked_write_and_read_roundtrip(client: aerospike.Client, namesp
     assert await storage.read("large") == large_value
 
 
+async def test_chunked_write_carries_ttl_on_chunk_records(client: aerospike.Client, namespace: str) -> None:
+    storage = AerospikeStorage(namespace, client=client, max_value_size=10, ttl=100)
+    large_value = b"0123456789" * 5  # 50 bytes, well over the 10-byte threshold
+
+    await storage.write("large", large_value)
+
+    for index in range(5):
+        chunk_key = (namespace, "strands_storage_chunks", f"large#{index}")
+        _, meta, _ = client.get(chunk_key)
+        ttl = meta["ttl"]
+        assert 0 < ttl <= 100, f"chunk {index} ttl was {ttl!r}, expected a positive value <= 100"
+
+
 async def test_overwriting_chunked_value_with_small_value_clears_chunks(
     client: aerospike.Client, namespace: str
 ) -> None:
@@ -77,6 +103,20 @@ async def test_overwriting_chunked_value_with_small_value_clears_chunks(
     chunk_key = ("test", "strands_storage_chunks", "key#0")
     with pytest.raises(aerospike.exception.RecordNotFound):
         client.get(chunk_key)
+
+
+async def test_overwriting_small_value_with_chunked_value_clears_stale_v_bin(
+    client: aerospike.Client, namespace: str
+) -> None:
+    storage = AerospikeStorage(namespace, client=client, max_value_size=10)
+    await storage.write("key", b"small")
+
+    large_value = b"0123456789" * 5  # 50 bytes, well over the 10-byte threshold
+    await storage.write("key", large_value)
+
+    # The stale "v" bin from the earlier inline write must not resurrect on a
+    # later read -- the chunked reassembly must win, not the leftover bytes.
+    assert await storage.read("key") == large_value
 
 
 async def test_search_ranks_by_token_overlap(storage: AerospikeStorage) -> None:

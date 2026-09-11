@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import aerospike
 import pytest
 
@@ -68,3 +70,20 @@ async def test_add_stores_metadata(store: AerospikeMemoryStore) -> None:
     results = await store.search("tagged fact durable")
 
     assert results[0].metadata == {"source": "conversation-1"}
+
+
+async def test_add_has_no_process_local_lock(store: AerospikeMemoryStore) -> None:
+    assert not hasattr(store, "_write_lock")
+
+
+async def test_concurrent_add_to_same_heading_preserves_all_facts(store: AerospikeMemoryStore) -> None:
+    writer_count = 8
+
+    await asyncio.gather(*(store.add(f"# Shared heading\nfact-{i}") for i in range(writer_count)))
+
+    results = await store.search("shared heading")
+
+    assert len(results) == 1
+    content = results[0].content
+    for i in range(writer_count):
+        assert f"fact-{i}" in content
