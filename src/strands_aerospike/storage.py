@@ -134,7 +134,7 @@ class AerospikeStorage:
                     meta=self._meta(),
                 )
             else:
-                self._write_chunked(key, data)
+                self._write_chunked(key, data, meta=self._meta())
             if previous_chunk_count:
                 self._remove_chunks(key, previous_chunk_count)
         except aerospike_exception.AerospikeError as error:
@@ -158,11 +158,11 @@ class AerospikeStorage:
         if previous_chunk_count:
             self._remove_chunks(key, previous_chunk_count)
 
-    def _write_chunked(self, key: str, data: bytes) -> None:
+    def _write_chunked(self, key: str, data: bytes, *, meta: dict[str, int]) -> None:
         chunks = [data[i : i + self._max_value_size] for i in range(0, len(data), self._max_value_size)]
         writes = [
             batch_records.Write(
-                self._chunk_record_key(key, index), [ops.write(_VALUE_BIN, bytes(chunk))], meta=self._meta()
+                self._chunk_record_key(key, index), [ops.write(_VALUE_BIN, bytes(chunk))], meta=meta
             )
             for index, chunk in enumerate(chunks)
         ]
@@ -174,7 +174,7 @@ class AerospikeStorage:
                     ops.write(_CHUNK_COUNT_BIN, len(chunks)),
                     ops.write(_VALUE_BIN, aerospike.null()),
                 ],
-                meta=self._meta(),
+                meta=meta,
             )
         )
         result = self._client.batch_write(batch_records.BatchRecords(writes))
