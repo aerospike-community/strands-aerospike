@@ -25,6 +25,7 @@ _DEFAULT_MAX_VALUE_SIZE = 900_000
 _KEY_BIN = "k"
 _VALUE_BIN = "v"
 _CHUNK_COUNT_BIN = "n"
+_CHUNK_GENERATION_BIN = "g"
 
 
 def _chunk_set(set_name: str) -> str:
@@ -37,9 +38,18 @@ def _chunk_set(set_name: str) -> str:
     return f"{set_name}_chunks"
 
 
-def _chunk_key(key: str, index: int) -> str:
-    """Return the chunk-set key for the given logical key and chunk index."""
-    return f"{key}#{index}"
+def _chunk_key(key: str, generation: int, index: int) -> str:
+    """Return the chunk-set key for the given logical key, generation, and chunk index.
+
+    The generation is part of the key (not just a bin) so that a chunked write
+    never shares key-space with the chunks it is about to replace: the new
+    generation's chunks are written and the primary record's pointer is flipped
+    to reference them before the previous generation's chunks are deleted. That
+    ordering guarantees readers never observe a partial set of chunks, and that
+    cleanup of the old generation can never delete data the new write just
+    created.
+    """
+    return f"{key}#{generation}#{index}"
 
 
 class AerospikeStorage:
@@ -101,8 +111,8 @@ class AerospikeStorage:
     def _primary_key(self, key: str) -> tuple[str, str, str]:
         return (self._namespace, self._set, key)
 
-    def _chunk_record_key(self, key: str, index: int) -> tuple[str, str, str]:
-        return (self._namespace, self._chunk_set, _chunk_key(key, index))
+    def _chunk_record_key(self, key: str, generation: int, index: int) -> tuple[str, str, str]:
+        return (self._namespace, self._chunk_set, _chunk_key(key, generation, index))
 
     async def write(self, key: str, data: bytes) -> None:
         """Store data under key, overwriting any existing value (and stale chunks).
@@ -125,44 +135,53 @@ class AerospikeStorage:
             # failed/partial new write has already destroyed the old value's chunks,
             # turning a would-be write failure into permanent data loss on read.
             # Removing them only after the new write succeeds keeps the old value
-            # intact (and readable) until the new one is durably in place.
-            previous_chunk_count = self._get_previous_chunk_count(key)
+            # intact (and readable) until the new one is durably in place. This is
+            # safe even when both the previous and new value are chunked, because
+            # each chunked write uses a fresh generation number in its chunk keys
+            # (see ``_chunk_key``) -- the new chunks never occupy the same keys as
+            # the previous generation's, so cleanup can only ever remove chunks
+            # that predate the write that just succeeded.
+            previous = self._get_previous_chunk_meta(key)
             if len(data) <= self._max_value_size:
                 self._client.put(
                     self._primary_key(key),
-                    {_KEY_BIN: key, _VALUE_BIN: bytes(data), _CHUNK_COUNT_BIN: aerospike.null()},
+                    {
+                        _KEY_BIN: key,
+                        _VALUE_BIN: bytes(data),
+                        _CHUNK_COUNT_BIN: aerospike.null(),
+                        _CHUNK_GENERATION_BIN: aerospike.null(),
+                    },
                     meta=self._meta(),
                 )
             else:
-                self._write_chunked(key, data, meta=self._meta())
-            if previous_chunk_count:
-                self._remove_chunks(key, previous_chunk_count)
+                next_generation = previous[1] + 1 if previous is not None else 0
+                self._write_chunked(key, data, generation=next_generation, meta=self._meta())
+            if previous is not None:
+                previous_chunk_count, previous_generation = previous
+                self._remove_chunks(key, previous_generation, previous_chunk_count)
         except aerospike_exception.AerospikeError as error:
             raise StorageError(f"Failed to write '{key}'") from error
 
-    def _get_previous_chunk_count(self, key: str) -> int | None:
-        """Return key's existing chunk count, if any, without removing anything."""
+    def _get_previous_chunk_meta(self, key: str) -> tuple[int, int] | None:
+        """Return key's existing (chunk count, generation), if any, without removing anything."""
         try:
             _, _, bins = self._client.get(self._primary_key(key))
         except aerospike_exception.RecordNotFound:
             return None
-        return bins.get(_CHUNK_COUNT_BIN)  # type: ignore[no-any-return]
+        chunk_count = bins.get(_CHUNK_COUNT_BIN)
+        if chunk_count is None:
+            return None
+        return chunk_count, bins.get(_CHUNK_GENERATION_BIN, 0)
 
-    def _remove_chunks(self, key: str, chunk_count: int) -> None:
-        chunk_keys = [self._chunk_record_key(key, index) for index in range(chunk_count)]
+    def _remove_chunks(self, key: str, generation: int, chunk_count: int) -> None:
+        chunk_keys = [self._chunk_record_key(key, generation, index) for index in range(chunk_count)]
         self._client.batch_remove(chunk_keys)
 
-    def _clear_existing_chunks(self, key: str) -> None:
-        """Remove any chunk records left over from a previous chunked write under key."""
-        previous_chunk_count = self._get_previous_chunk_count(key)
-        if previous_chunk_count:
-            self._remove_chunks(key, previous_chunk_count)
-
-    def _write_chunked(self, key: str, data: bytes, *, meta: dict[str, int]) -> None:
+    def _write_chunked(self, key: str, data: bytes, *, generation: int, meta: dict[str, int]) -> None:
         chunks = [data[i : i + self._max_value_size] for i in range(0, len(data), self._max_value_size)]
         writes = [
             batch_records.Write(
-                self._chunk_record_key(key, index), [ops.write(_VALUE_BIN, bytes(chunk))], meta=meta
+                self._chunk_record_key(key, generation, index), [ops.write(_VALUE_BIN, bytes(chunk))], meta=meta
             )
             for index, chunk in enumerate(chunks)
         ]
@@ -172,6 +191,7 @@ class AerospikeStorage:
                 [
                     ops.write(_KEY_BIN, key),
                     ops.write(_CHUNK_COUNT_BIN, len(chunks)),
+                    ops.write(_CHUNK_GENERATION_BIN, generation),
                     ops.write(_VALUE_BIN, aerospike.null()),
                 ],
                 meta=meta,
@@ -208,9 +228,10 @@ class AerospikeStorage:
         chunk_count = bins.get(_CHUNK_COUNT_BIN)
         if chunk_count is None:
             raise StorageError(f"Record for '{key}' has neither a value nor a chunk count")
+        generation = bins.get(_CHUNK_GENERATION_BIN, 0)
 
         try:
-            chunk_keys = [self._chunk_record_key(key, index) for index in range(chunk_count)]
+            chunk_keys = [self._chunk_record_key(key, generation, index) for index in range(chunk_count)]
             result = self._client.batch_read(chunk_keys)
         except aerospike_exception.AerospikeError as error:
             raise StorageError(f"Failed to read chunks for '{key}'") from error
@@ -220,7 +241,8 @@ class AerospikeStorage:
         # string -- lexicographic order would place "key#10" before "key#2".
         by_chunk_key = {item.key[2]: item for item in result.batch_records}
         return b"".join(
-            bytes(by_chunk_key[_chunk_key(key, index)].record[2][_VALUE_BIN]) for index in range(chunk_count)
+            bytes(by_chunk_key[_chunk_key(key, generation, index)].record[2][_VALUE_BIN])
+            for index in range(chunk_count)
         )
 
     async def delete(self, key: str) -> None:
@@ -236,10 +258,13 @@ class AerospikeStorage:
 
     def _delete_sync(self, key: str) -> None:
         try:
-            previous_chunk_count = self._get_previous_chunk_count(key)
+            previous = self._get_previous_chunk_meta(key)
             keys = [self._primary_key(key)]
-            if previous_chunk_count:
-                keys.extend(self._chunk_record_key(key, index) for index in range(previous_chunk_count))
+            if previous is not None:
+                previous_chunk_count, previous_generation = previous
+                keys.extend(
+                    self._chunk_record_key(key, previous_generation, index) for index in range(previous_chunk_count)
+                )
             self._client.batch_remove(keys)
         except aerospike_exception.RecordNotFound:
             pass

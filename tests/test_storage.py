@@ -46,7 +46,7 @@ async def test_delete_removes_chunked_value_and_all_chunks(client: aerospike.Cli
 
     assert await storage.read("large") is None
     for index in range(5):
-        chunk_key = (namespace, "strands_storage_chunks", f"large#{index}")
+        chunk_key = (namespace, "strands_storage_chunks", f"large#0#{index}")
         with pytest.raises(aerospike.exception.RecordNotFound):
             client.get(chunk_key)
 
@@ -84,7 +84,7 @@ async def test_chunked_write_carries_ttl_on_chunk_records(client: aerospike.Clie
     await storage.write("large", large_value)
 
     for index in range(5):
-        chunk_key = (namespace, "strands_storage_chunks", f"large#{index}")
+        chunk_key = (namespace, "strands_storage_chunks", f"large#0#{index}")
         _, meta, _ = client.get(chunk_key)
         ttl = meta["ttl"]
         assert 0 < ttl <= 100, f"chunk {index} ttl was {ttl!r}, expected a positive value <= 100"
@@ -100,9 +100,45 @@ async def test_overwriting_chunked_value_with_small_value_clears_chunks(
 
     assert await storage.read("key") == b"small"
     # The stale chunk records must not resurrect on a later read.
-    chunk_key = ("test", "strands_storage_chunks", "key#0")
+    chunk_key = ("test", "strands_storage_chunks", "key#0#0")
     with pytest.raises(aerospike.exception.RecordNotFound):
         client.get(chunk_key)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(b"abcdefghij" * 5, id="same_chunk_count"),
+        pytest.param(b"abcdefghij" * 3, id="shrink_chunk_count"),
+    ],
+)
+async def test_overwriting_chunked_value_with_another_chunked_value(
+    client: aerospike.Client, namespace: str, replacement: bytes
+) -> None:
+    storage = AerospikeStorage(namespace, client=client, max_value_size=10)
+    await storage.write("key", b"0123456789" * 5)  # 50 bytes -> 5 chunks
+
+    # Both the old and new generation would occupy the same chunk keys (key#0..)
+    # if the generation weren't part of the key, so the post-write cleanup of the
+    # old chunks must not delete the chunks this same call just wrote.
+    await storage.write("key", replacement)
+
+    assert await storage.read("key") == replacement
+
+
+async def test_overwriting_chunked_value_with_growing_chunked_value(
+    client: aerospike.Client, namespace: str
+) -> None:
+    storage = AerospikeStorage(namespace, client=client, max_value_size=10)
+    await storage.write("key", b"0123456789" * 3)  # 30 bytes -> 3 chunks
+
+    replacement = b"abcdefghij" * 5  # 50 bytes -> 5 chunks
+    await storage.write("key", replacement)
+
+    # An assertion on the full returned bytes (rather than just "did it raise")
+    # catches a regression where growing the chunk count loses only the
+    # overlapping chunks instead of failing outright.
+    assert await storage.read("key") == replacement
 
 
 async def test_overwriting_small_value_with_chunked_value_clears_stale_v_bin(
